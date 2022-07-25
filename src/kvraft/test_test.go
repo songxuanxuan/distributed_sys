@@ -87,7 +87,7 @@ func checkClntAppends(t *testing.T, clnt int, v string, count int) {
 		}
 		off1 := strings.LastIndex(v, wanted)
 		if off1 != off {
-			t.Fatalf("duplicate element %v in Append result", wanted)
+			t.Fatalf("duplicate element %v in Append result, got %v", wanted, v)
 		}
 		if off <= lastoff {
 			t.Fatalf("wrong order for element %v in Append result", wanted)
@@ -97,7 +97,7 @@ func checkClntAppends(t *testing.T, clnt int, v string, count int) {
 }
 
 // check that all known appends are present in a value,
-// and are in order for each concurrent client.
+// and are in order for each concurrent client
 func checkConcurrentAppends(t *testing.T, v string, counts []int) {
 	nclients := len(counts)
 	for i := 0; i < nclients; i++ {
@@ -174,7 +174,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 	} else {
 		title = title + "one client"
 	}
-	title = title + " (" + part + ")" // 3A or 3B
+	title = title + " (" + part + ")" // 3A or 3B.
 
 	const nservers = 5
 	cfg := make_config(t, nservers, unreliable, maxraftstate)
@@ -202,19 +202,23 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			}()
 			last := ""
 			key := strconv.Itoa(cli)
+			//log.Printf("[%d]: client new put %v\n", cli, key)
 			Put(cfg, myck, key, last)
 			for atomic.LoadInt32(&done_clients) == 0 {
+
 				if (rand.Int() % 1000) < 500 {
 					nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					// log.Printf("%d: client new append %v\n", cli, nv)
+					//log.
+					//log.Printf("[%d]: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv)
 					last = NextValue(last, nv)
+					//log.Printf("[%d]: client last %v\n", cli, last)
 					j++
 				} else {
-					// log.Printf("%d: client new get %v\n", cli, key)
+					//log.Printf("[%d]: client new get key %v\n", cli, key)
 					v := Get(cfg, myck, key)
 					if v != last {
-						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+						log.Fatalf("[%d] get wrong value, key %v, wanted:\n%v\n, got\n%v\n", cli, key, last, v)
 					}
 				}
 			}

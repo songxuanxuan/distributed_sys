@@ -290,7 +290,9 @@ loop:
 
 		failed := false
 		cmds := []int{}
+
 		for index := range is {
+			DPrintf(2, " index : %v", index)
 			cmd := cfg.wait(index, servers, term)
 			if ix, ok := cmd.(int); ok {
 				if ix == -1 {
@@ -314,7 +316,7 @@ loop:
 			}()
 			continue
 		}
-
+		DPrintf(2, "logs : %v", cfg.logs)
 		for ii := 0; ii < iters; ii++ {
 			x := 100 + ii
 			ok := false
@@ -712,15 +714,18 @@ func TestFigure82C(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2C): Figure 8")
-
-	cfg.one(rand.Int(), 1, true)
+	cnt := 0
+	//cfg.one(rand.Int()%100, 1, true)
+	cfg.one(cnt, 1, true)
+	cnt++
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
-				_, _, ok := cfg.rafts[i].Start(rand.Int())
+				_, _, ok := cfg.rafts[i].Start(cnt)
+				cnt++
 				if ok {
 					leader = i
 				}
@@ -783,7 +788,7 @@ func TestUnreliableAgree2C(t *testing.T) {
 		cfg.one(iters, 1, true)
 	}
 
-	cfg.setunreliable(false)
+	cfg.setunreliable(true)
 
 	wg.Wait()
 	DPrintf(1, "-----last one(100) check-----")

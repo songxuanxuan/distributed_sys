@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"hash/fnv"
 	"log"
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 func _ihash(key string) int {
@@ -25,11 +27,67 @@ func sort_index() {
 	log.Printf("%v", s)
 }
 
-func decrease() {
+type xx struct {
+	inter interface{}
+}
+
+type Inter struct {
+	inx int
+	iny int
+}
+
+func interfaceTest() {
+	x := Inter{inx: 123, iny: 456}
+	a := xx{inter: x}
+	i := a.inter.(Inter).inx
+	fmt.Printf("%v", i)
 
 }
 
+func getIndexTest() {
+	str := "apple apple"
+	i := strings.LastIndex(str, "app")
+	end := strings.Index(str[i:], "l") + i + 1
+
+	fmt.Printf("%v", str[i:end])
+}
+
+func chanTestAux(ch chan int, i int) {
+	go func() {
+		time.Sleep(time.Second)
+		select {
+		case <-ch:
+			fmt.Printf("client receive chan time out \n")
+			return
+		case <-time.After(time.Second):
+			return
+		}
+
+	}()
+	ch <- i
+	ch <- 2
+
+}
+func chanTest() {
+	ch := make(chan int)
+	go chanTestAux(ch, 1)
+	j := <-ch
+	fmt.Printf("%d \n", j)
+	time.Sleep(3 * time.Second)
+	//k := <-ch
+	//fmt.Printf("%d \n", k)
+	//m := <-ch
+	//fmt.Printf("%d \n", m)
+}
+
+func testAppend() {
+	x := []int{1, 2, 3, 4}
+	y := []int{33, 44, 55}
+	x = append(x[:3], y...)
+	fmt.Printf("%v", x)
+}
+
 func main() {
-	sort_index()
+	testAppend()
 	//fmt.Println(_ihash("bads"))
 }

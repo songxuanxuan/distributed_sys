@@ -20,6 +20,7 @@ package raft
 import (
 	"../labgob"
 	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -72,10 +73,10 @@ type Raft struct {
 	applyChan      chan ApplyMsg       // 发起日志应用通过该通道
 	muApply        deadlock.Mutex      // 专门用于提交apply的锁
 	// 非易失性数据
-	currentTerm int   // 当前服务器已知的最新任期(初始化为0)
-	votedFor    int   // 当前任期内投给选票的候选者id, 如果没投为空
-	log         []Log //日志条目; 每个log包含状态机的命令, leader收到命令时的任期(第一个索引为1!!)
-
+	currentTerm int           // 当前服务器已知的最新任期(初始化为0)
+	votedFor    int           // 当前任期内投给选票的候选者id, 如果没投为空
+	log         []Log         //日志条目; 每个log包含状态机的命令, leader收到命令时的任期(第一个索引为1!!)
+	logBuffer   []interface{} //用来缓存新的指令
 	// 易失性数据
 	// note: 在lastApplied和commitIndex之间是已经认可, 但是还没有提交的log
 	lastApplied int //最后一个已经提交了的log index(初始0)
@@ -198,6 +199,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.resetRandomInterval()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
+	defer func() {
+		if r := recover(); r != nil {
+			DPrintf(1, "[%d] out of range logs %v", rf.me, rf.log)
+			fmt.Errorf("panic: %v", r)
+			os.Exit(1)
+		}
+	}()
 	lastEntry := rf.getLastEntry()
 	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
@@ -228,6 +236,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = math.MaxInt
 		}
 	}
+
 	rf.mu.Unlock()
 	rf.persist() // 持久化操作.
 
@@ -286,31 +295,34 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
 	term = rf.currentTerm
 	if rf.state != LEADER {
 		isLeader = false
 	} else {
-		rf.Commit(command)
+		index = rf.Commit(command)
+
 	}
-	index = len(rf.log) - 1
+	//index = len(rf.log) - 1
 	return index, term, isLeader
 }
 
-func (rf *Raft) Commit(command interface{}) {
+func (rf *Raft) Commit(command interface{}) int {
 	rf.mu.Lock()
 	DPrintf(0, "[%d] beginning a commit in idx %d,term %d", rf.me, len(rf.log), rf.currentTerm)
+	index := len(rf.log)
 	newLog := Log{
 		Command: command,
 		Term:    rf.currentTerm,
-		Idx:     len(rf.log),
+		Idx:     index,
 	}
 	rf.log = append(rf.log, newLog)
 	// 设置自己的状态
-	rf.matchIdex[rf.me] = len(rf.log) - 1
-	rf.nextIndex[rf.me] = len(rf.log)
+	rf.matchIdex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+
 	rf.mu.Unlock()
 	rf.persist() // 持久化.
+	return index
 }
 
 type AppendEntriesArgs struct {
@@ -339,7 +351,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 
-	DPrintf(0, "[%d] got append/beat from %d, term %d-%d, len of entries %d",
+	DPrintf(1, "[%d] got append/beat from %d, term %d-%d, len of entries %d",
 		rf.me, args.LeaderId, rf.currentTerm, args.Term, len(args.Entries))
 	if rf.currentTerm > args.Term {
 		// leader term 比自己小
@@ -366,7 +378,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = args.LeaderCommit
 			go rf.apply() //todo
 		}
-		// 如果是心跳, 就结束
+		// 如果是心跳, 就结束.
 		return
 	}
 	lastId := args.Entries[len(args.Entries)-1].Idx
@@ -376,7 +388,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
 		// 成功找到符合的log,直接追加.
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-		DPrintf(3, "[%d] update data logs: %v", rf.me, rf.log)
+		DPrintf(2, "[%d] update data logs: %v", rf.me, rf.log)
 		// 更新commitIndex
 		//	如果是心跳, 说明之前已经完成复制了, apply即可 x
 		//	如果携带log, 追加log再进行apply *
@@ -390,13 +402,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 	} else {
-		// prev处的term不同 删除后面的log, 后续重新请求.直接覆盖即可, leader的log长度必不小于普通节点
+		// prev处的term不同 删除后面的log, 后续重新请求.直接覆盖即可, leader的log长度必不小于普通节点.
 		//rf.log = append(rf.log[:args.PrevLogIndex+1], rf.log[rf.commitIndex+1:]...)
+		DPrintf(2, "[%d] update failed data logs: %v", rf.me, rf.log)
+
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	}
+
 	rf.mu.Unlock()
+	DPrintf(2, "[%d] received prevIndex %d, prevTerm %d unlock-----", rf.me, args.PrevLogIndex, args.PrevLogTerm)
 	rf.persist() // 持久化
+
 	//for i := rf.commitIndex; i >= 0; i-- {
 	//	if rf.log[i].Idx == args.PrevLogIndex {
 	//		if rf.log[i].Term == args.PrevLogTerm {
@@ -421,8 +439,8 @@ func (rf *Raft) SendAppendEntries(server int) {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: rf.matchIdex[server],
-		PrevLogTerm:  rf.log[rf.matchIdex[server]].Term,
+		PrevLogIndex: rf.nextIndex[server] - 1,
+		PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
 		Entries:      rf.log[rf.nextIndex[server]:], // 如果都完成了同步, 正好为空作为心跳
 		LeaderCommit: rf.commitIndex,
 	}
@@ -440,7 +458,12 @@ func (rf *Raft) SendAppendEntries(server int) {
 			rf.ConverToFollower(reply.Term)
 		} else {
 			// 没有找到吻合的entry, 重试同步
-			rf.nextIndex[server]--
+			DPrintf(2, "[%d] commit failed occur when log=%v", rf.me, rf.log)
+			if rf.nextIndex[server] > 0 {
+				rf.nextIndex[server]--
+			}
+
+			//rf.matchIdex[server]--
 		}
 
 	} else if rf.nextIndex[server] < endOfLog {
@@ -452,56 +475,68 @@ func (rf *Raft) SendAppendEntries(server int) {
 	}
 }
 
-// leader 根据matchIndex[]设置commitIndex
+// leader 根据matchIndex[]设置commitIndex..
 func (rf *Raft) resetCommitIndex() {
 	rf.mu.Lock()
 	idx_cp := make([]int, len(rf.matchIdex))
 	copy(idx_cp, rf.matchIdex)
 	sort.Ints(idx_cp)
-	rf.commitIndex = idx_cp[len(idx_cp)/2]
+	if rf.commitIndex < idx_cp[len(idx_cp)/2] {
+		rf.commitIndex = idx_cp[len(idx_cp)/2]
+	}
 	if rf.commitIndex < rf.lastApplied {
 		rf.commitIndex = rf.lastApplied
 	}
 
 	DPrintf(1, "[%d] resetCommitIndex to %d", rf.me, rf.commitIndex)
+
 	rf.mu.Unlock()
 	rf.persist() // 持久化操作
+
 }
 
 // 应用已经同步的log
 func (rf *Raft) apply() {
-	DPrintf(1, "[%d] begin apply lastApplied:%d, commitIndex:%d", rf.me, rf.lastApplied, rf.commitIndex)
+	if rf.state == LEADER {
+		DPrintf(1, "[%d] begin apply lastApplied:%d, commitIndex:%d", rf.me, rf.lastApplied, rf.commitIndex)
+	}
 	rf.mu.Lock()
 	applied := rf.lastApplied
 	commitTo := rf.commitIndex
-	rf.mu.Unlock()
+	rf.lastApplied = commitTo //先设置完成，避免其他线程同时进行apply
+	//rf.mu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
 			DPrintf(1, "[%d] out of range logs %v", rf.me, rf.log)
 			os.Exit(1)
 		}
 	}()
+	var apps []ApplyMsg
 	for ; applied < commitTo; applied++ {
-		//DPrintf(1, "[%d] send log :%v", rf.me, rf.log[applied+1].Command)
-		rf.mu.Lock()
+		DPrintf(1, "[%d] apply send log :%v", rf.me, rf.log[applied+1].Command)
+		//rf.mu.Lock()
 		app := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[applied+1].Command,
 			CommandIndex: applied + 1,
 		}
+		//rf.mu.Unlock()
+		apps = append(apps, app)
+		//if rf.state == LEADER {
+		//	DPrintf(-1, "[%d] apply to chan command:%v appliedId %d,commitTo %d", rf.me, app.Command, applied, commitTo)
+		//}
 
-		rf.mu.Unlock()
-
-		rf.muApply.Lock()
-		rf.applyChan <- app
-		rf.muApply.Unlock()
 	}
-	rf.mu.Lock()
-	rf.lastApplied = applied
-
 	rf.mu.Unlock()
+	rf.muApply.Lock()
+	for _, app := range apps {
+		rf.applyChan <- app
+	}
+	rf.muApply.Unlock()
 	rf.persist() // 持久化操作
+
 	DPrintf(1, "[%d] apply completed lastApplied:%d", rf.me, rf.lastApplied)
+
 }
 
 func (rf *Raft) sendAppendEntriesAux(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -524,9 +559,12 @@ func (rf *Raft) initLeader() {
 //	leader 给其他发送心跳
 func (rf *Raft) OperateLeader(server int) {
 	// todo: 成为leader后先同步一个空entry
-	for {
-		//DPrintf(2, "[%d] begin sending heartbeat to %d\n", rf.me, server)
+	//DPrintf(2, "[%d] begin sending heartbeat to %d\n", rf.me, server)
+	rf.SendAppendEntries(server)
 
+}
+func (rf *Raft) leaderManager() {
+	for {
 		if rf.dead == 1 {
 			return
 		}
@@ -536,14 +574,23 @@ func (rf *Raft) OperateLeader(server int) {
 			return
 		}
 		rf.mu.Unlock()
-		go rf.SendAppendEntries(server)
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me {
+				go rf.OperateLeader(i)
+			}
+		}
+
 		time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
 	}
+
 }
 
 func (rf *Raft) getLastEntry() Log {
 	if rf.commitIndex == 0 {
 		return Log{}
+	}
+	if rf.commitIndex >= len(rf.log) {
+		return rf.log[len(rf.log)-1]
 	}
 	return rf.log[rf.commitIndex]
 }
@@ -613,27 +660,30 @@ func (rf *Raft) preVoteAux() bool {
 	got := make(chan bool)
 	count := 1
 	for i := 0; i < len(rf.peers); i++ {
+		if count >= (len(rf.peers)+1)/2 {
+			break
+		}
 		go func(i int) {
 			reply := PreVoteReply{}
 			args := PreVoteArgs{}
 			ok := rf.peers[i].Call("Raft.PreVote", &args, &reply)
 			if ok && reply.Connected {
-				got <- true
+				count++
+				if count >= (len(rf.peers)+1)/2 {
+					got <- true
+				}
 			}
 		}(i)
 	}
-	for {
-		select {
-		case <-got:
-			count++
-			if count >= (len(rf.peers)+1)/2 {
-				return true
-			}
-		case <-time.After(time.Duration(rf.randomInterval-10) * time.Millisecond):
-			DPrintf(1, "[%d] preVote failed", rf.me)
-			return false
-		}
+
+	select {
+	case <-got:
+		return true
+	case <-time.After(time.Duration(rf.randomInterval-10) * time.Millisecond):
+		DPrintf(1, "[%d] preVote failed", rf.me)
+		return false
 	}
+
 }
 
 // AttemptElection 开始竞选, 发送给所有其他服务器.
@@ -641,14 +691,18 @@ func (rf *Raft) AttemptElection() {
 	if !rf.preVoteAux() {
 		return
 	}
+	DPrintf(2, "[%d] success preVote in Term %d\n", rf.me, rf.currentTerm)
+
 	rf.mu.Lock()
 	rf.state = CANDIDATE
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	DPrintf(0, "[%d] attempting an election in Term %d\n", rf.me, rf.currentTerm)
 	term := rf.currentTerm
+
 	rf.mu.Unlock()
 	rf.persist() // 持久化
+
 	total := len(rf.peers)
 	voteCount := 1
 	var countMu deadlock.Mutex
@@ -685,11 +739,8 @@ func (rf *Raft) AttemptElection() {
 		case <-accepted:
 			rf.ConverToLeader()
 			// 开始发送心跳
-			for i := 0; i < len(rf.peers); i++ {
-				if i != rf.me {
-					go rf.OperateLeader(i)
-				}
-			}
+			go rf.leaderManager()
+
 			return
 		case <-time.After(time.Millisecond * time.Duration(rf.randomInterval)): //超时就不再等待
 			// 重新尝试
@@ -726,9 +777,11 @@ func (rf *Raft) CallRequestVote(server int, term int) bool {
 
 		rf.state = FOLLOWER
 		rf.votedFor = -1
+
 		rf.mu.Unlock()
+		rf.persist() // 持久化.
+
 		//rf.currentTerm = reply.Term
-		rf.persist() // 持久化
 	} else {
 		rf.mu.Unlock()
 	}
@@ -765,8 +818,10 @@ func (rf *Raft) ConverToFollower(term int) {
 	rf.state = FOLLOWER
 	rf.currentTerm = term
 	rf.votedFor = -1
+
 	rf.mu.Unlock()
 	rf.persist() // 持久化
+
 	rf.resetRandomInterval()
 }
 
@@ -774,7 +829,7 @@ func (rf *Raft) ConverToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = LEADER
-	DPrintf(0, "[%d] become leader (currentTerm=%d)\n", rf.me, rf.currentTerm)
+	DPrintf(-1, "[%d] become leader (currentTerm=%d)\n", rf.me, rf.currentTerm)
 	rf.matchIdex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i, _ := range rf.nextIndex {
@@ -795,7 +850,7 @@ func (rf *Raft) ConverToLeader() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	deadlock.Opts.Disable = true
+	deadlock.Opts.Disable = false
 	deadlock.Opts.DeadlockTimeout = time.Second * 3
 	rf := &Raft{}
 	rf.mu.Lock()
@@ -805,7 +860,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionFlag = make(chan bool)
 	rf.state = FOLLOWER
-	rf.log = append(rf.log, Log{})
+	rf.log = append(rf.log, Log{Term: 0, Idx: 0})
 	rf.mu.Unlock()
 	rf.applyChan = applyCh
 	// Your initialization code here (2A, 2B, 2C).

@@ -194,6 +194,7 @@ func (cfg *config) start1(i int) {
 				cfg.mu.Unlock()
 
 				if m.CommandIndex > 1 && prevok == false {
+					DPrintf(2, "out range when logs:%v", cfg.logs)
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
 				}
 			}
@@ -376,6 +377,8 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
+		//DPrintf(2, "i:%v,index:%v------cmd1 %v ok %v", i, index, cmd1, ok)
+
 		cfg.mu.Unlock()
 
 		if ok {
@@ -455,6 +458,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
+		//DPrintf(2, "start index: %d", index)
 
 		if index != -1 {
 			// somebody claimed to be the leader and to have
@@ -471,9 +475,11 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 					}
 				}
 				time.Sleep(20 * time.Millisecond)
+				//DPrintf(2, "nd %v cmd1 %v", nd, cmd1)
 			}
 			DPrintf(2, "logs: %v", cfg.logs)
 			if retry == false {
+
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {
