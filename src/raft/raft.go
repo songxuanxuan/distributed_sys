@@ -72,11 +72,13 @@ type Raft struct {
 	electionFlag   chan bool           // 重置选举后通知标志
 	applyChan      chan ApplyMsg       // 发起日志应用通过该通道
 	muApply        deadlock.Mutex      // 专门用于提交apply的锁
+	available      bool                //处于少数分区的leader，拒绝start读写操作
+	nOK            int                 //正常接受的心跳的节点数量
+	muOK           deadlock.Mutex
 	// 非易失性数据
-	currentTerm int           // 当前服务器已知的最新任期(初始化为0)
-	votedFor    int           // 当前任期内投给选票的候选者id, 如果没投为空
-	log         []Log         //日志条目; 每个log包含状态机的命令, leader收到命令时的任期(第一个索引为1!!)
-	logBuffer   []interface{} //用来缓存新的指令
+	currentTerm int   // 当前服务器已知的最新任期(初始化为0)
+	votedFor    int   // 当前任期内投给选票的候选者id, 如果没投为空
+	log         []Log //日志条目; 每个log包含状态机的命令, leader收到命令时的任期(第一个索引为1!!)
 	// 易失性数据
 	// note: 在lastApplied和commitIndex之间是已经认可, 但是还没有提交的log
 	lastApplied int //最后一个已经提交了的log index(初始0)
@@ -140,8 +142,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var log []Log
@@ -160,8 +161,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
 	}
-	DPrintf(1, "[%d] reading Persist, voteF:%d, term:%d, log:%v",
+	DPrintf(-1, "[%d] reading Persist, voteF:%d, term:%d, log:%v",
 		rf.me, rf.votedFor, rf.currentTerm, rf.log)
+}
+func (rf *Raft) ExposeLog() *[]Log {
+	return &rf.log
 }
 
 //
@@ -294,14 +298,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
 	term = rf.currentTerm
-	if rf.state != LEADER {
+	if rf.state != LEADER { // 如果不是leader或者处于少数分区
+		isLeader = false
+	} else if rf.available == false { //todo:可能available更新不及时
+		//if !rf.preVoteAux() {
+		//	DPrintf(1, "[%d] available is false", rf.me)
+		//	isLeader = false
+		//} else {
+		//	rf.available = true
+		//}
+		DPrintf(1, "[%d] available is false", rf.me)
 		isLeader = false
 	} else {
 		index = rf.Commit(command)
-
 	}
+
 	//index = len(rf.log) - 1
 	return index, term, isLeader
 }
@@ -432,8 +444,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 // 发送心跳/同步
-func (rf *Raft) SendAppendEntries(server int) {
+func (rf *Raft) SendAppendEntries(server int) bool {
 	//DPrintf(0, "[%d] sending heartbeat/append to %d\n", rf.me, server)
+	defer func() {
+		if r := recover(); r != nil {
+			DPrintf(-1, "[%d] out of range logs %v, state %v", rf.me, rf.log, rf.state)
+			fmt.Errorf("panic: %v", r)
+			os.Exit(1)
+		}
+	}()
 	rf.mu.Lock()
 	endOfLog := len(rf.log)
 	args := AppendEntriesArgs{
@@ -448,7 +467,7 @@ func (rf *Raft) SendAppendEntries(server int) {
 	rf.mu.Unlock()
 	ok := rf.sendAppendEntriesAux(server, &args, &reply)
 	if !ok || args.Term != rf.currentTerm || rf.state != LEADER {
-		return
+		return ok
 	}
 	// 发现其他人返回的term比较大, 或者日志比较新, 退出领导人
 	// reply.Term > rf.currentTerm
@@ -473,6 +492,7 @@ func (rf *Raft) SendAppendEntries(server int) {
 		rf.resetCommitIndex()
 		go rf.apply()
 	}
+	return ok
 }
 
 // leader 根据matchIndex[]设置commitIndex..
@@ -557,13 +577,17 @@ func (rf *Raft) initLeader() {
 
 // OperateLeader
 //	leader 给其他发送心跳
-func (rf *Raft) OperateLeader(server int) {
-	// todo: 成为leader后先同步一个空entry
+func (rf *Raft) OperateLeader(server int, ok *int, mutex *deadlock.Mutex) {
 	//DPrintf(2, "[%d] begin sending heartbeat to %d\n", rf.me, server)
-	rf.SendAppendEntries(server)
-
+	if rf.SendAppendEntries(server) {
+		mutex.Lock()
+		*ok++
+		mutex.Unlock()
+	}
 }
 func (rf *Raft) leaderManager() {
+	ok := 1
+	mu := deadlock.Mutex{}
 	for {
 		if rf.dead == 1 {
 			return
@@ -574,13 +598,20 @@ func (rf *Raft) leaderManager() {
 			return
 		}
 		rf.mu.Unlock()
+
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				go rf.OperateLeader(i)
+				go rf.OperateLeader(i, &ok, &mu)
 			}
 		}
 
 		time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
+		//等待检查是否超过半数节点成功接受心跳
+		if rf.nOK < (len(rf.peers)+1)/2 && !rf.preVoteAux() {
+			rf.available = false
+		} else {
+			rf.available = true
+		}
 	}
 
 }
@@ -654,9 +685,9 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	reply.Connected = true
 }
 
-// 查看连接状态
+// 查看连接状态,处于大多数分区返回true
 func (rf *Raft) preVoteAux() bool {
-	DPrintf(1, "[%d] preVoting...", rf.me)
+	DPrintf(1, "[%d] preVoting/check connecting...", rf.me)
 	got := make(chan bool)
 	count := 1
 	for i := 0; i < len(rf.peers); i++ {
@@ -679,8 +710,8 @@ func (rf *Raft) preVoteAux() bool {
 	select {
 	case <-got:
 		return true
-	case <-time.After(time.Duration(rf.randomInterval-10) * time.Millisecond):
-		DPrintf(1, "[%d] preVote failed", rf.me)
+	case <-time.After(50 * time.Millisecond): //todo: 时间有影响吗
+		DPrintf(1, "[%d] preVote/check connecting. failed", rf.me)
 		return false
 	}
 
@@ -802,7 +833,7 @@ func (rf *Raft) CallRequestVote(server int, term int) bool {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	//rf.log = nil
 	DPrintf(0, "[%d] to be shutdown!", rf.me)
 }
 
@@ -829,6 +860,7 @@ func (rf *Raft) ConverToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = LEADER
+	rf.available = true
 	DPrintf(-1, "[%d] become leader (currentTerm=%d)\n", rf.me, rf.currentTerm)
 	rf.matchIdex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -850,7 +882,7 @@ func (rf *Raft) ConverToLeader() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	deadlock.Opts.Disable = false
+	deadlock.Opts.Disable = true
 	deadlock.Opts.DeadlockTimeout = time.Second * 3
 	rf := &Raft{}
 	rf.mu.Lock()
@@ -863,7 +895,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log, Log{Term: 0, Idx: 0})
 	rf.mu.Unlock()
 	rf.applyChan = applyCh
-	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

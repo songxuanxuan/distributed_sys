@@ -525,6 +525,7 @@ func TestOnePartition3A(t *testing.T) {
 	done1 := make(chan bool)
 
 	cfg.begin("Test: no progress in minority (3A)")
+	DPrintf(1, "-----part %v : %v -----", p1, p2)
 	go func() {
 		Put(cfg, ckp2a, "1", "15")
 		done0 <- true

@@ -54,17 +54,19 @@ func getIndexTest() {
 
 func chanTestAux(ch chan int, i int) {
 	go func() {
-		time.Sleep(time.Second)
+		//time.Sleep(time.Second)
 		select {
 		case <-ch:
-			fmt.Printf("client receive chan time out \n")
+			fmt.Printf("client receive chan  \n")
 			return
 		case <-time.After(time.Second):
+			fmt.Printf("client time out \n")
 			return
 		}
 
 	}()
 	ch <- i
+	ch = nil
 	ch <- 2
 
 }
@@ -87,7 +89,25 @@ func testAppend() {
 	fmt.Printf("%v", x)
 }
 
+func checkGo() {
+	i := 1
+
+	go func(ip *int) {
+		i++
+	}(&i)
+	go func(ip *int) {
+		time.Sleep(time.Second)
+		fmt.Printf("i=%v\n", i)
+	}(&i)
+	fmt.Printf("func end.. \n")
+}
+func check() {
+	fmt.Printf("func end..\n")
+
+}
+
 func main() {
-	testAppend()
-	//fmt.Println(_ihash("bads"))
+	checkGo()
+	time.Sleep(2 * time.Second)
+	fmt.Println("main end..")
 }

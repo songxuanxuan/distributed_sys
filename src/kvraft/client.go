@@ -34,7 +34,7 @@ func (ck *Clerk) findLeader() {
 	msgChan := make(chan string)
 	doneId := -1
 	for i, _ := range ck.servers {
-		go ck.GetRPC("", i, msgChan, &doneId)
+		go ck.GetRPC("", i, &msgChan, &doneId)
 	}
 	select {
 	case <-msgChan:
@@ -66,12 +66,11 @@ func (ck *Clerk) Get(key string) string {
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
-		go ck.GetRPC(key, ck.leaderId, msgChan, &done)
+		go ck.GetRPC(key, ck.leaderId, &msgChan, &done)
 		select {
 		case msg := <-msgChan:
 			if done == -1 {
 				ck.leaderId = -1
-				break
 			} else {
 				return msg
 			}
@@ -83,7 +82,10 @@ func (ck *Clerk) Get(key string) string {
 	}
 
 }
-func (ck *Clerk) GetRPC(key string, i int, msg chan string, doneId *int) {
+func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
+	if *doneId >= 0 {
+		return
+	}
 	args := GetArgs{
 		Key:       key,
 		ClientId:  ck.clientId,
@@ -92,18 +94,25 @@ func (ck *Clerk) GetRPC(key string, i int, msg chan string, doneId *int) {
 	reply := GetReply{}
 
 	ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-	if *doneId >= 0 {
-		return
-	}
-	if !ok || reply.Err == ErrWrongLeader {
+
+	if !ok {
 		DPrintf(2, "server [%d] failed for getting %v", i, key)
+	} else if reply.Err == ErrWrongLeader {
+		DPrintf(2, "server [%d] is not leader", i)
 	} else {
 		*doneId = i
 		DPrintf(2, "server [%d] success for getting %v", i, reply.Value)
-		msg <- reply.Value
-		return
 	}
-
+	*msg <- reply.Value
+	// 如果没人接受消息， 超时后自己接受从而释放这个协程
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-*msg:
+			break
+		case <-time.After(time.Duration(100 * time.Millisecond)):
+		}
+	}()
 }
 
 //
@@ -128,8 +137,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		go ck.PutAppendRPC(key, value, op, ck.leaderId, &done, msg)
 		select {
 		case <-msg:
-			DPrintf(0, "client[%d] success %v %v %v", ck.clientId, op, key, value)
-			return
+			if done {
+				DPrintf(0, "client[%d] success %v %v %v", ck.clientId, op, key, value)
+				return
+			} else {
+				ck.leaderId = -1
+				DPrintf(0, "client[%d] failed %v %v %v", ck.clientId, op, key, value)
+			}
+
 		case <-time.After(2 * time.Second):
 			DPrintf(1, "time out PutAppend %v %v", key, value)
 			ck.leaderId = -1
@@ -155,9 +170,8 @@ func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *
 	} else {
 		*done = true
 		DPrintf(1, "success for %v %v %v", op, key, value)
-		msg <- true
-		return
 	}
+	msg <- true
 
 }
 

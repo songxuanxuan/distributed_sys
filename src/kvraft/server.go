@@ -6,6 +6,7 @@ import (
 	"../raft"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync/atomic"
 	"time"
 )
@@ -29,7 +30,7 @@ type Op struct {
 	RequestId int
 	Key       string
 	Value     string
-	OpChan    chan Result
+	ChanKey   int
 }
 
 type KVServer struct {
@@ -39,14 +40,30 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate  int               // snapshot if log grows this big
-	logStorage    map[string]string //所有日志追加到后面
-	lastRequestId map[int64]int     //每个客户端最后提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
+	maxraftstate  int                 // snapshot if log grows this big
+	logStorage    map[string]string   //所有日志追加到后面
+	lastRequestId map[int64]int       //每个客户端最后提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
+	clientChan    map[int]chan Result //每个请求端维护一个通道
 	lastIndex     int
 }
 
+func (kv *KVServer) createClientChan() int {
+	rand.Seed(time.Now().UnixNano())
+	key := rand.Int()
+	if _, ok := kv.clientChan[key]; !ok {
+		kv.clientChan[key] = make(chan Result)
+	}
+	return key
+}
+func (kv *KVServer) freeClientChan() {
+	kv.clientChan = nil
+}
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	DPrintf(1, "[%d]trying getrpc %v", kv.me, args.Key)
+	//if kv.killed() {
+	//	reply.Err = ErrWrongLeader
+	//	return
+	//}
+	DPrintf(1, "[%d]trying get rpc %v", kv.me, args.Key)
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -58,37 +75,44 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Value = ""
 		return
 	}
+	chanKey := kv.createClientChan()
 	//查找最后一个匹配的位置，即是最新的值
-	opChan := make(chan Result)
 	op := Op{
 		Command:   "Get",
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 		Key:       args.Key,
 		Value:     "",
-		OpChan:    opChan,
+		ChanKey:   chanKey,
 	}
-	msg := raft.ApplyMsg{
-		CommandValid: true,
-		Command:      op,
-		CommandIndex: 0,
+	//msg := raft.ApplyMsg{
+	//	CommandValid: true,
+	//	Command:      op,
+	//	CommandIndex: 0,
+	//}
+	_, _, is := kv.rf.Start(op)
+	if !is {
+		reply.Err = ErrWrongLeader
+		return
 	}
-	kv.applyCh <- msg
+
 	info := fmt.Sprintf("[%d]... get %v", kv.me, args.Key)
-	result := chanReceiver(opChan, info)
+	result := kv.chanReceiver(chanKey, info)
 	reply.Err = result.Err
 	reply.Value = result.Value
 }
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	//if kv.killed() {
+	//	reply.Err = ErrWrongLeader
+	//	return
+	//}
 	DPrintf(1, "[%d] trying %v %v %v", kv.me, args.Op, args.Key, args.Value)
-	opChan := make(chan Result)
 	op := Op{
 		Command:   args.Op,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 		Key:       args.Key,
 		Value:     args.Value,
-		OpChan:    opChan,
 	}
 	kv.mu.Lock()
 	if kv.isDuplicate(&op) {
@@ -97,6 +121,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Unlock()
+	chanKey := kv.createClientChan()
+	op.ChanKey = chanKey
 	_, _, is := kv.rf.Start(op)
 	if !is {
 		reply.Err = ErrWrongLeader
@@ -106,10 +132,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//一直等待日志提交
 	//result := <-opChan
 	info := fmt.Sprintf("[%d]waiting receive... %v %v", kv.me, args.Op, args.Value)
-	result := chanReceiver(opChan, info)
+	result := kv.chanReceiver(chanKey, info)
 	reply.Err = result.Err
 	if result.Ok {
-		DPrintf(0, "get applied %v", kv.logStorage[args.Key])
+		//DPrintf(0, "get applied %v", kv.logStorage[args.Key])
 	} else {
 		DPrintf(0, "get applied failed because %v", result.Err)
 
@@ -131,26 +157,28 @@ func (kv *KVServer) isDuplicate(op *Op) bool {
 }
 
 //
-func chanSender(chanWay chan Result, msg Result, info string) {
+func (kv *KVServer) chanSender(chanKey int, msg Result, info string) {
 	DPrintf(1, "begin chan %v, value %v", info, msg)
 	go func() {
 		// 检测2秒后，客户端的rpc还没把结果取走就认为网络掉了，自己关闭这个chan
 		time.Sleep(2 * time.Second)
 		select {
-		case <-chanWay:
+		case <-kv.clientChan[chanKey]:
 			DPrintf(1, "client receive chan time out chan %v, value %v", info, msg)
+			//kv.clientChan[chanKey] = nil
 			return
 		case <-time.After(2 * time.Second):
 			return
 		}
 	}()
-	chanWay <- msg
+	kv.clientChan[chanKey] <- msg
 }
-func chanReceiver(chanWay chan Result, info string) Result {
+func (kv *KVServer) chanReceiver(chanKey int, info string) Result {
 	DPrintf(1, "begin chan %v ", info)
 	select {
-	case msg := <-chanWay:
+	case msg := <-kv.clientChan[chanKey]:
 		DPrintf(1, "end chan %v value %v", info, msg)
+		//kv.clientChan[chanKey] = nil
 		return msg
 	case <-time.After(time.Second * 3):
 		DPrintf(1, "end chan %v because time out ", info)
@@ -212,7 +240,9 @@ func (kv *KVServer) opResolver(op *Op) Result {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	//kv.logStorage = nil
+	//kv.lastRequestId = nil
+	//kv.freeClientChan()
 }
 
 func (kv *KVServer) killed() bool {
@@ -237,7 +267,7 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	deadlock.Opts.Disable = false
+	deadlock.Opts.Disable = true
 	deadlock.Opts.DeadlockTimeout = time.Second * 3
 	labgob.Register(Op{})
 
@@ -246,15 +276,35 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.lastRequestId = make(map[int64]int)
 	kv.logStorage = make(map[string]string)
+	kv.clientChan = make(map[int]chan Result)
 	kv.lastIndex = -1
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.recoverData()
 	//单独开线程来接受apply
 	go kv.receiveApply()
 
 	return kv
 }
+
+// 根据raft的log恢复kv数据
+func (kv *KVServer) recoverData() {
+	logP := kv.rf.ExposeLog()
+	if len(*logP) > 1 {
+		for _, l := range (*logP)[1:] {
+			op := l.Command.(Op)
+			if op.Command == "Get" {
+				continue
+			} else if op.Command == "Put" {
+				kv.logStorage[op.Key] = op.Value
+			} else {
+				kv.logStorage[op.Key] += op.Value
+			}
+			kv.lastRequestId[op.ClientId] = op.RequestId
+		}
+	}
+}
+
 func (kv *KVServer) receiveApply() {
 	for {
 		if kv.dead == 1 {
@@ -282,7 +332,7 @@ func (kv *KVServer) receiveApply() {
 		}
 		DPrintf(1, "[%d] got raft applied %v %v %v index:%v-%v", kv.me, op.Command, op.Key, op.Value, kv.lastIndex, msg.CommandIndex)
 		info := fmt.Sprintf("[%d]to send msg from %v %v", kv.me, op.Command, op.Value)
-		go chanSender(op.OpChan, result, info) //将结果发送给相应的请求客户端
+		go kv.chanSender(op.ChanKey, result, info) //将结果发送给相应的请求客户端
 		kv.mu.Lock()
 		DPrintf(1, "[%d] logStorage %v", kv.me, kv.logStorage)
 		kv.mu.Unlock()
