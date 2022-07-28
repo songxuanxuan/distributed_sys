@@ -12,7 +12,8 @@ type Clerk struct {
 	// You will have to modify this struct
 	leaderId  int
 	clientId  int64
-	requestId int
+	requestId int64
+	delay     int
 }
 
 func nrand() int64 {
@@ -34,13 +35,19 @@ func (ck *Clerk) findLeader() {
 	msgChan := make(chan string)
 	doneId := -1
 	for i, _ := range ck.servers {
-		go ck.GetRPC("", i, &msgChan, &doneId)
+		if ck.leaderId == -1 {
+			go ck.GetRPC("", i, &msgChan, &doneId)
+		}
 	}
 	select {
 	case <-msgChan:
+		if doneId != -1 {
+			DPrintf(-1, "found leader %d ", doneId)
+		}
 		ck.leaderId = doneId
+		ck.delay = 100
 	case <-time.After(time.Duration(2000 * time.Millisecond)):
-		DPrintf(1, "time out for find leader")
+		DPrintf(-1, "time out for find leader ")
 	}
 }
 
@@ -58,14 +65,14 @@ func (ck *Clerk) findLeader() {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
-	DPrintf(1, "----first try to get %v----", key)
+	DPrintf(-1, "----first try to get %v----", key)
 	msgChan := make(chan string)
 	done := -1
 	for {
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
+		DPrintf(-1, "ck[%v]try to get %v----server %d", ck.clientId, key, ck.leaderId)
 		go ck.GetRPC(key, ck.leaderId, &msgChan, &done)
 		select {
 		case msg := <-msgChan:
@@ -98,7 +105,7 @@ func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
 	if !ok {
 		DPrintf(2, "server [%d] failed for getting %v", i, key)
 	} else if reply.Err == ErrWrongLeader {
-		DPrintf(2, "server [%d] is not leader", i)
+		DPrintf(2, "server [%d] is not leader key %v", i, key)
 	} else {
 		*doneId = i
 		DPrintf(2, "server [%d] success for getting %v", i, reply.Value)
@@ -106,11 +113,12 @@ func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
 	*msg <- reply.Value
 	// 如果没人接受消息， 超时后自己接受从而释放这个协程
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(time.Duration(ck.delay) * time.Millisecond)
 		select {
 		case <-*msg:
+			ck.delay += 40
 			break
-		case <-time.After(time.Duration(100 * time.Millisecond)):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}()
 }
@@ -127,14 +135,14 @@ func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	done := false
-	ck.requestId++ // 一次任务只能自增一次
+	ck.requestId = nrand()
 	msg := make(chan bool)
 	DPrintf(1, "----first try to %v %v %v----", op, key, value)
 	for {
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
-		go ck.PutAppendRPC(key, value, op, ck.leaderId, &done, msg)
+		go ck.PutAppendRPC(key, value, op, ck.leaderId, &done, &msg)
 		select {
 		case <-msg:
 			if done {
@@ -152,7 +160,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 
 }
-func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *bool, msg chan bool) {
+func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *bool, msg *chan bool) {
+	if *done {
+		return
+	}
 	args := PutAppendArgs{
 		Key:       key,
 		Value:     value,
@@ -162,17 +173,24 @@ func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *
 	}
 	reply := PutAppendReply{}
 	ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-	if *done {
-		return
-	}
 	if !ok || reply.Err != OK {
 		DPrintf(1, "failed for %v %v %v because %v", op, key, value, reply.Err)
 	} else {
 		*done = true
 		DPrintf(1, "success for %v %v %v", op, key, value)
 	}
-	msg <- true
+	*msg <- true
+	// !!put 和 append 消息不应该被释放，否则会引起数据不一致!!?????
 
+	// 如果没人接受消息， 超时后自己接受从而释放这个协程.
+	go func() {
+		time.Sleep(2 * time.Second)
+		select {
+		case <-*msg:
+			break
+		case <-time.After(time.Duration(100 * time.Millisecond)):
+		}
+	}()
 }
 
 func (ck *Clerk) Put(key string, value string) {

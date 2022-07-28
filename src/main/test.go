@@ -105,9 +105,16 @@ func check() {
 	fmt.Printf("func end..\n")
 
 }
+func mapTest() {
+	m := make(map[int]map[int]int)
+	mp := m[1]
+	mp = make(map[int]int)
+	mp[1] = 2
+	fmt.Printf("m:%v mp:%v\n", m, mp)
+
+}
 
 func main() {
-	checkGo()
-	time.Sleep(2 * time.Second)
+	mapTest()
 	fmt.Println("main end..")
 }

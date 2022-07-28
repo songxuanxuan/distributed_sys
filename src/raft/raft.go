@@ -68,7 +68,7 @@ type Raft struct {
 	me             int                 // this peer's index into peers[]
 	dead           int32               // set by Kill()
 	state          int                 //身份
-	randomInterval int                 //随机生成的选举超时时间
+	randomInterval int32               //随机生成的选举超时时间
 	electionFlag   chan bool           // 重置选举后通知标志
 	applyChan      chan ApplyMsg       // 发起日志应用通过该通道
 	muApply        deadlock.Mutex      // 专门用于提交apply的锁
@@ -104,9 +104,9 @@ type Log struct {
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//DPrintf(-1, "[%d] getState : %v", rf.me, rf.state)
 	term = rf.currentTerm
 	isleader = rf.state == LEADER
 	return term, isleader
@@ -123,6 +123,8 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	rf.mu.Lock()
+	DPrintf(99, "[%d] stored Persist, voteF:%d, term:%d, log:%v",
+		rf.me, rf.votedFor, rf.currentTerm, rf.log)
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
@@ -131,8 +133,7 @@ func (rf *Raft) persist() {
 	rf.mu.Unlock()
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	DPrintf(99, "[%d] stored Persist, voteF:%d, term:%d, log:%v",
-		rf.me, rf.votedFor, rf.currentTerm, rf.log)
+
 }
 
 //
@@ -161,7 +162,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
 	}
-	DPrintf(-1, "[%d] reading Persist, voteF:%d, term:%d, log:%v",
+	DPrintf(1, "[%d] reading Persist, voteF:%d, term:%d, log:%v",
 		rf.me, rf.votedFor, rf.currentTerm, rf.log)
 }
 func (rf *Raft) ExposeLog() *[]Log {
@@ -195,21 +196,11 @@ type RequestVoteReply struct {
 //	return 任期号, 是否投票.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-
 	DPrintf(0, "[%d] got request vote from %d, term:%d-%d, lastCommit %d",
-		rf.me, args.CandidateId, rf.currentTerm, args.Term, rf.commitIndex)
-	defer DPrintf(1, "[%d] return request vote from %d, term:%d-%d, lastCommit %d",
 		rf.me, args.CandidateId, rf.currentTerm, args.Term, rf.commitIndex)
 	rf.resetRandomInterval()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	defer func() {
-		if r := recover(); r != nil {
-			DPrintf(1, "[%d] out of range logs %v", rf.me, rf.log)
-			fmt.Errorf("panic: %v", r)
-			os.Exit(1)
-		}
-	}()
 	lastEntry := rf.getLastEntry()
 	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
@@ -308,7 +299,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//} else {
 		//	rf.available = true
 		//}
-		DPrintf(1, "[%d] available is false", rf.me)
+		DPrintf(-1, "[%d] available is false", rf.me)
 		isLeader = false
 	} else {
 		index = rf.Commit(command)
@@ -517,10 +508,10 @@ func (rf *Raft) resetCommitIndex() {
 
 // 应用已经同步的log
 func (rf *Raft) apply() {
+	rf.mu.Lock()
 	if rf.state == LEADER {
 		DPrintf(1, "[%d] begin apply lastApplied:%d, commitIndex:%d", rf.me, rf.lastApplied, rf.commitIndex)
 	}
-	rf.mu.Lock()
 	applied := rf.lastApplied
 	commitTo := rf.commitIndex
 	rf.lastApplied = commitTo //先设置完成，避免其他线程同时进行apply
@@ -609,8 +600,10 @@ func (rf *Raft) leaderManager() {
 		//等待检查是否超过半数节点成功接受心跳
 		if rf.nOK < (len(rf.peers)+1)/2 && !rf.preVoteAux() {
 			rf.available = false
+			DPrintf(2, "[%d] set available false", rf.me)
 		} else {
 			rf.available = true
+			DPrintf(2, "[%d] set available true", rf.me)
 		}
 	}
 
@@ -640,7 +633,8 @@ func (rf *Raft) resetRandomInterval() {
 
 	rand.Seed(time.Now().UnixNano())
 	//rf.mu.Lock()
-	rf.randomInterval = rand.Intn(ElectionInterval) + ElectionInterval
+	atomic.StoreInt32(&rf.randomInterval, rand.Int31n(ElectionInterval)+ElectionInterval)
+	//rf.randomInterval = rand.Intn(ElectionInterval) + ElectionInterval
 	//rf.mu.Unlock()
 	go func() {
 		rf.electionFlag <- true
@@ -656,8 +650,9 @@ func (rf *Raft) Tick() {
 		if rf.dead == 1 {
 			return
 		}
+		interval := atomic.LoadInt32(&rf.randomInterval)
 		//rf.mu.Lock()
-		interval := rf.randomInterval
+		//interval := rf.randomInterval
 		//rf.mu.Unlock()
 		select {
 		case <-rf.electionFlag: // 重置计时器.
@@ -690,6 +685,7 @@ func (rf *Raft) preVoteAux() bool {
 	DPrintf(1, "[%d] preVoting/check connecting...", rf.me)
 	got := make(chan bool)
 	count := 1
+	mu := deadlock.Mutex{}
 	for i := 0; i < len(rf.peers); i++ {
 		if count >= (len(rf.peers)+1)/2 {
 			break
@@ -699,7 +695,9 @@ func (rf *Raft) preVoteAux() bool {
 			args := PreVoteArgs{}
 			ok := rf.peers[i].Call("Raft.PreVote", &args, &reply)
 			if ok && reply.Connected {
+				mu.Lock()
 				count++
+				mu.Unlock()
 				if count >= (len(rf.peers)+1)/2 {
 					got <- true
 				}
@@ -722,9 +720,9 @@ func (rf *Raft) AttemptElection() {
 	if !rf.preVoteAux() {
 		return
 	}
-	DPrintf(2, "[%d] success preVote in Term %d\n", rf.me, rf.currentTerm)
 
 	rf.mu.Lock()
+	DPrintf(2, "[%d] success preVote in Term %d\n", rf.me, rf.currentTerm)
 	rf.state = CANDIDATE
 	rf.currentTerm++
 	rf.votedFor = rf.me
