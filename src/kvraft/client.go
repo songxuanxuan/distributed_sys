@@ -42,12 +42,12 @@ func (ck *Clerk) findLeader() {
 	select {
 	case <-msgChan:
 		if doneId != -1 {
-			DPrintf(-1, "found leader %d ", doneId)
+			DPrintf(1, "found leader %d ", doneId)
 		}
 		ck.leaderId = doneId
 		ck.delay = 100
 	case <-time.After(time.Duration(2000 * time.Millisecond)):
-		DPrintf(-1, "time out for find leader ")
+		DPrintf(1, "time out for find leader ")
 	}
 }
 
@@ -65,14 +65,14 @@ func (ck *Clerk) findLeader() {
 //
 func (ck *Clerk) Get(key string) string {
 
-	DPrintf(-1, "----first try to get %v----", key)
+	DPrintf(-1, "----clnt[%d] first try to get %v----", ck.clientId, key)
 	msgChan := make(chan string)
 	done := -1
 	for {
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
-		DPrintf(-1, "ck[%v]try to get %v----server %d", ck.clientId, key, ck.leaderId)
+		DPrintf(1, "ck[%v]try to get %v----server %d", ck.clientId, key, ck.leaderId)
 		go ck.GetRPC(key, ck.leaderId, &msgChan, &done)
 		select {
 		case msg := <-msgChan:
@@ -137,7 +137,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	done := false
 	ck.requestId = nrand()
 	msg := make(chan bool)
-	DPrintf(1, "----first try to %v %v %v----", op, key, value)
+	DPrintf(-1, "----clnt[%d] first try to %v %v %v----", ck.clientId, op, key, value)
 	for {
 		for ck.leaderId == -1 {
 			ck.findLeader()

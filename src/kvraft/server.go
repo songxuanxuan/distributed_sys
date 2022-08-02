@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -12,7 +13,7 @@ import (
 )
 import "github.com/sasha-s/go-deadlock"
 
-const Debug = -1
+const Debug = 0
 
 func DPrintf(level int, format string, a ...interface{}) (n int, err error) {
 	if Debug > level {
@@ -40,12 +41,15 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate  int                      // snapshot if log grows this big
-	logStorage    map[string]string        //所有日志追加到后面
-	lastRequestId map[int64]map[int64]bool //每个客户端最后提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
-	clientChan    map[int]chan Result      //每个请求端维护一个通道
-	muChan        deadlock.Mutex
-	lastIndex     int
+	maxraftstate     int                      // snapshot if log grows this big
+	logStorage       map[string]string        //所有日志追加到后面
+	lastRequestId    map[int64]map[int64]bool //每个客户端最后提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
+	clientChan       map[int]chan Result      //每个请求端维护一个通道
+	muChan           deadlock.Mutex
+	lastIndex        int
+	lastTerm         int
+	lastIncludeIndex int
+	lastIncludeTerm  int
 }
 
 func (kv *KVServer) createClientChan() int {
@@ -71,44 +75,58 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//}
 	DPrintf(1, "[%d]trying get rpc %v", kv.me, args.Key)
 	_, isLeader := kv.rf.GetState()
+	// todo: available
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		reply.Value = ""
 		return
 	}
-
+	// for finding leader
 	if len(args.Key) == 0 {
 		reply.Err = OK
 		reply.Value = ""
 		return
 	}
-	DPrintf(-1, "[%d]trying get rpc %v leader", kv.me, args.Key)
-	chanKey := kv.createClientChan()
-	//查找最后一个匹配的位置，即是最新的值
-	op := Op{
-		Command:   "Get",
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		Key:       args.Key,
-		Value:     "",
-		ChanKey:   chanKey,
+	if !kv.rf.IsAvailable() {
+		reply.Err = ErrWrongLeader
+		reply.Value = ""
+		return
 	}
+	DPrintf(1, "[%d]trying get rpc %v leader", kv.me, args.Key)
+	//chanKey := kv.createClientChan()
+	//查找最后一个匹配的位置，即是最新的值
+	//op := Op{
+	//	Command:   "Get",
+	//	ClientId:  args.ClientId,
+	//	RequestId: args.RequestId,
+	//	Key:       args.Key,
+	//	Value:     "",
+	//	ChanKey:   chanKey,
+	//}
 	//msg := raft.ApplyMsg{
 	//	CommandValid: true,
 	//	Command:      op,
 	//	CommandIndex: 0,
 	//}
-	_, _, is := kv.rf.Start(op)
-	if !is {
-		DPrintf(-1, "-------[%d] wrong leader after start", kv.me)
-		reply.Err = ErrWrongLeader
-		return
-	}
+	//_, _, is := kv.rf.Start(op)
+	//if !is {
+	//	DPrintf(1, "-------[%d] wrong leader after start", kv.me)
+	//	reply.Err = ErrWrongLeader
+	//	return
+	//}
 
-	info := fmt.Sprintf("[%d]... get %v", kv.me, args.Key)
-	result := kv.chanReceiver(chanKey, info)
-	reply.Err = result.Err
-	reply.Value = result.Value
+	//info := fmt.Sprintf("[%d]... get %v", kv.me, args.Key)
+	//result := kv.chanReceiver(chanKey, info)
+	//reply.Err = result.Err
+	//reply.Value = result.Value
+	kv.mu.Lock()
+	if value, ok := kv.logStorage[args.Key]; ok {
+		reply.Value = value
+	} else {
+		//DPrintf(-1, "[%d] err no key : %v, log: %v", kv.me, op.Key, kv.logStorage)
+		reply.Err = ErrNoKey
+	}
+	kv.mu.Unlock()
 }
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//if kv.killed() {
@@ -191,14 +209,15 @@ func (kv *KVServer) chanReceiver(chanKey int, info string) Result {
 	kv.muChan.Lock()
 	clientChan := kv.clientChan[chanKey]
 	kv.muChan.Unlock()
-	DPrintf(-1, "begin chan %v ", info)
+	DPrintf(1, "begin chan %v ", info)
 	select {
 	case msg := <-clientChan:
 		DPrintf(1, "end chan %v value %v", info, msg)
 		//kv.clientChan[chanKey] = nil
+
 		return msg
-	case <-time.After(time.Second * 2):
-		DPrintf(-1, "end chan %v because time out ", info)
+	case <-time.After(time.Second * 1):
+		DPrintf(1, "end chan %v because time out ", info)
 		return Result{Ok: false, Value: "", Err: ErrWrongLeader}
 	}
 
@@ -297,7 +316,7 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	deadlock.Opts.Disable = false
+	deadlock.Opts.Disable = true
 	deadlock.Opts.DeadlockTimeout = time.Second * 3
 	labgob.Register(Op{})
 
@@ -308,8 +327,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.logStorage = make(map[string]string)
 	kv.clientChan = make(map[int]chan Result)
 	kv.lastIndex = -1
+	kv.lastTerm = 0
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.recoverSnapshot()
 	kv.recoverData()
 	//单独开线程来接受apply
 	go kv.receiveApply()
@@ -344,6 +365,47 @@ func (kv *KVServer) recoverData() {
 	}
 }
 
+func (kv *KVServer) saveSnapshot() {
+	if kv.maxraftstate < 0 {
+		return
+	}
+	if kv.rf.ShouldSnapshot(kv.maxraftstate) {
+		DPrintf(1, "[%d] saveSnapshot ", kv.me)
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		kv.mu.Lock()
+		kv.lastIncludeIndex = kv.lastIndex
+		kv.lastIncludeTerm = kv.lastTerm
+		e.Encode(kv.logStorage)
+		e.Encode(kv.lastIncludeIndex)
+		e.Encode(kv.lastIncludeTerm)
+		kv.mu.Unlock()
+		data := w.Bytes()
+		kv.rf.SaveStateAndSnapshot(kv.lastIndex, data)
+	}
+}
+
+func (kv *KVServer) recoverSnapshot() {
+	data := kv.rf.ReadSnapshot()
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logStorage map[string]string
+	var lastIncludeIndex int
+	var lastTerm int
+	if d.Decode(&logStorage) != nil || d.Decode(&lastIncludeIndex) != nil ||
+		d.Decode(&lastTerm) != nil {
+		DPrintf(-99, "[%d] kv recoverSnapshot failed", kv.me)
+	} else {
+		kv.logStorage = logStorage
+		kv.lastIncludeIndex = lastIncludeIndex
+		kv.lastTerm = lastTerm
+	}
+}
+
 func (kv *KVServer) receiveApply() {
 	for {
 		if kv.dead == 1 {
@@ -358,11 +420,12 @@ func (kv *KVServer) receiveApply() {
 
 		op := msg.Command.(Op)
 
-		//if op.Command != "Get" && msg.CommandIndex <= kv.lastIndex {
-		//	// 避免多次apply产生过多的chan消息.
-		//	continue
-		//}
-		//kv.lastIndex = msg.CommandIndex
+		if op.Command != "Get" && msg.CommandIndex <= kv.lastIndex {
+			// 避免多次apply产生过多的chan消息.
+			continue
+		}
+		kv.lastIndex = msg.CommandIndex
+		kv.lastTerm = msg.CommandTerm
 		result := kv.opResolver(&op)
 		kv.mu.Lock()
 		DPrintf(3, "[%d] after apply logStorage %v", kv.me, kv.logStorage)
@@ -372,10 +435,12 @@ func (kv *KVServer) receiveApply() {
 		if !result.Ok {
 			continue
 		}
+		go kv.saveSnapshot()
+
 		if _, isLeader := kv.rf.GetState(); !isLeader {
 			continue
 		}
-		DPrintf(-1, "[%d] got raft applied %v %v %v index:%v-%v", kv.me, op.Command, op.Key, op.Value, kv.lastIndex, msg.CommandIndex)
+		DPrintf(1, "[%d] got raft applied %v %v %v index:%v-%v", kv.me, op.Command, op.Key, op.Value, kv.lastIndex, msg.CommandIndex)
 		info := fmt.Sprintf("[%d]to send msg from %v %v", kv.me, op.Command, op.Value)
 		go kv.chanSender(op.ChanKey, result, info) //将结果发送给相应的请求客户端
 

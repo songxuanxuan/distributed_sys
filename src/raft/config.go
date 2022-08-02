@@ -477,7 +477,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 				//DPrintf(2, "nd %v cmd1 %v", nd, cmd1)
 			}
-			DPrintf(2, "logs: %v", cfg.logs)
+			DPrintf(2, "config:logs: %v", cfg.logs)
 			if retry == false {
 
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
