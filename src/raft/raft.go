@@ -410,20 +410,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 重置选举计时器
 	rf.resetRandomInterval()
 
-	// 更新commitIndex.
-	//	如果是心跳, 说明之前已经完成复制了, apply即可	*
-	//	如果携带log, 追加log再进行apply	x
-	if len(args.Entries) == 0 {
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = args.LeaderCommit
-			go rf.apply()
-		}
-		// 如果是心跳, 就结束.
-		return
-	}
 	DPrintf(1, "[%d] got append from %d, term %d-%d, snapshot:%d,len of entries %d",
 		rf.me, args.LeaderId, rf.currentTerm, args.Term, rf.lastSnapshotIndex, len(args.Entries))
-	lastId := args.Entries[len(args.Entries)-1].Idx
 	//todo: 非领导者的log[] 最后一个log是commitIndex,
 	DPrintf(1, "[%d] received prevIndex %d, prevTerm %d", rf.me, args.PrevLogIndex, args.PrevLogTerm)
 	rf.mu.Lock()
@@ -431,6 +419,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果prev index 大于lastSnapshotIndex 正常同步， 小于说明需要进行snapshotRPC
 	if (args.PrevLogIndex == rf.lastSnapshotIndex && args.PrevLogTerm == rf.lastSnapshotTerm) ||
 		(args.PrevLogIndex > rf.lastSnapshotIndex && rf.getEntryByIndex(args.PrevLogIndex).Term == args.PrevLogTerm) {
+		// having same log as leader
+
+		// 更新commitIndex.
+		//	如果是心跳, 说明之前已经完成复制了, apply即可	*
+		//	如果携带log, 追加log再进行apply	x
+		if len(args.Entries) == 0 {
+			if args.LeaderCommit > rf.commitIndex {
+				rf.commitIndex = args.LeaderCommit
+				go rf.apply()
+			}
+			// 如果是心跳, 就结束.
+			rf.mu.Unlock()
+			return
+		}
 		// 成功找到符合的log,直接追加.
 		rf.log = append(rf.log[:args.PrevLogIndex+1-rf.lastSnapshotIndex], args.Entries...)
 		DPrintf(1, "[%d] update data logs: %v", rf.me, rf.log)
@@ -438,7 +440,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//	如果是心跳, 说明之前已经完成复制了, apply即可 x
 		//	如果携带log, 追加log再进行apply *
 		if args.LeaderCommit > rf.commitIndex {
-
+			lastId := args.Entries[len(args.Entries)-1].Idx
 			if lastId > args.LeaderCommit {
 				lastId = args.LeaderCommit
 			}
@@ -607,7 +609,7 @@ func (rf *Raft) apply() {
 		app := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[applied+1].Command,
-			CommandIndex: applied + 1 + rf.lastSnapshotIndex, //save as abs index
+			CommandIndex: rf.log[applied+1].Idx, //save as abs index
 			CommandTerm:  rf.log[applied+1].Term,
 		}
 		//rf.mu.Unlock()

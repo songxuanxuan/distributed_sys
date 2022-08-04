@@ -42,10 +42,10 @@ func (ck *Clerk) findLeader() {
 	select {
 	case <-msgChan:
 		if doneId != -1 {
-			DPrintf(1, "found leader %d ", doneId)
+			DPrintf(-1, "found leader %d ", doneId)
 		}
 		ck.leaderId = doneId
-		ck.delay = 100
+		ck.delay = 500
 	case <-time.After(time.Duration(2000 * time.Millisecond)):
 		DPrintf(1, "time out for find leader ")
 	}
@@ -72,17 +72,19 @@ func (ck *Clerk) Get(key string) string {
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
-		DPrintf(1, "ck[%v]try to get %v----server %d", ck.clientId, key, ck.leaderId)
+		done = -1 //in case of some failure
 		go ck.GetRPC(key, ck.leaderId, &msgChan, &done)
 		select {
 		case msg := <-msgChan:
 			if done == -1 {
 				ck.leaderId = -1
+				DPrintf(-1, "----clnt[%d] claim not leader; retry to get %v----", ck.clientId, key)
 			} else {
 				return msg
 			}
 		case <-time.After(time.Second):
-			DPrintf(1, "time out getting %v", key)
+			DPrintf(-1, "clnt[%d] time out getting %v, leader:%d", ck.clientId, key, ck.leaderId)
+			ck.leaderId = -1
 			break
 		}
 
@@ -101,7 +103,10 @@ func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
 	reply := GetReply{}
 
 	ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-
+	// more check to reduce chan send
+	if *doneId >= 0 {
+		return
+	}
 	if !ok {
 		DPrintf(2, "server [%d] failed for getting %v", i, key)
 	} else if reply.Err == ErrWrongLeader {
@@ -110,17 +115,20 @@ func (ck *Clerk) GetRPC(key string, i int, msg *chan string, doneId *int) {
 		*doneId = i
 		DPrintf(2, "server [%d] success for getting %v", i, reply.Value)
 	}
-	*msg <- reply.Value
 	// 如果没人接受消息， 超时后自己接受从而释放这个协程
 	go func() {
 		time.Sleep(time.Duration(ck.delay) * time.Millisecond)
 		select {
 		case <-*msg:
-			ck.delay += 40
+			ck.delay *= 2
+			DPrintf(1, "clnt[%d] got get RPC but no accept chan time out", ck.clientId)
 			break
-		case <-time.After(100 * time.Millisecond):
+		default:
+
 		}
 	}()
+	// blocked
+	*msg <- reply.Value
 }
 
 //
@@ -138,10 +146,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.requestId = nrand()
 	msg := make(chan bool)
 	DPrintf(-1, "----clnt[%d] first try to %v %v %v----", ck.clientId, op, key, value)
-	for {
+	for !done {
+
 		for ck.leaderId == -1 {
 			ck.findLeader()
 		}
+		DPrintf(-1, "----clnt[%d] retry to %v %v %v leader:%d done:%v----",
+			ck.clientId, op, key, value, ck.leaderId, done)
 		go ck.PutAppendRPC(key, value, op, ck.leaderId, &done, &msg)
 		select {
 		case <-msg:
@@ -150,11 +161,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				return
 			} else {
 				ck.leaderId = -1
-				DPrintf(0, "client[%d] failed %v %v %v", ck.clientId, op, key, value)
+				DPrintf(-1, "client[%d] failed %v %v %v", ck.clientId, op, key, value)
 			}
 
 		case <-time.After(2 * time.Second):
-			DPrintf(1, "time out PutAppend %v %v", key, value)
+			DPrintf(-1, "time out PutAppend %v %v leader:%d", key, value, ck.leaderId)
 			ck.leaderId = -1
 		}
 	}
@@ -172,16 +183,16 @@ func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *
 		RequestId: ck.requestId,
 	}
 	reply := PutAppendReply{}
+	//DPrintf(-1, "call for %v %v %v", op, key, value)
+
 	ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 	if !ok || reply.Err != OK {
-		DPrintf(1, "failed for %v %v %v because %v", op, key, value, reply.Err)
+		DPrintf(-1, "failed for %v %v %v because %v", op, key, value, reply.Err)
 	} else {
 		*done = true
-		DPrintf(1, "success for %v %v %v", op, key, value)
+		DPrintf(-1, "success for %v %v %v", op, key, value)
 	}
-	*msg <- true
 	// !!put 和 append 消息不应该被释放，否则会引起数据不一致!!?????
-
 	// 如果没人接受消息， 超时后自己接受从而释放这个协程.
 	go func() {
 		time.Sleep(2 * time.Second)
@@ -191,6 +202,8 @@ func (ck *Clerk) PutAppendRPC(key string, value string, op string, i int, done *
 		case <-time.After(time.Duration(100 * time.Millisecond)):
 		}
 	}()
+	*msg <- true
+
 }
 
 func (ck *Clerk) Put(key string, value string) {

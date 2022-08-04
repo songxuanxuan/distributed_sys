@@ -114,7 +114,36 @@ func mapTest() {
 
 }
 
+func chanDelay1(x chan int) {
+
+	go func() {
+		//time.Sleep(10 * time.Millisecond)
+		select {
+		case <-x:
+			fmt.Printf("in accepted\n")
+		case <-time.After(10 * time.Millisecond):
+			fmt.Printf("in not accepted\n")
+
+		}
+	}()
+	x <- 1
+}
+
+func chanDelayTest() {
+	x := make(chan int)
+	go chanDelay1(x)
+	//time.Sleep(1000 * time.Millisecond)
+	select {
+	case <-x:
+		fmt.Printf("out accepted\n")
+	case <-time.After(10 * time.Millisecond):
+		fmt.Printf("out not accepted\n")
+
+	}
+}
+
 func main() {
-	mapTest()
+	chanDelayTest()
+	time.Sleep(time.Second)
 	fmt.Println("main end..")
 }

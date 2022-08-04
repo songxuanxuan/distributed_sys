@@ -26,8 +26,8 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Command   string
-	ClientId  int64
+	Command string
+	//ClientId  int64
 	RequestId int64
 	Key       string
 	Value     string
@@ -41,10 +41,12 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate     int                      // snapshot if log grows this big
-	logStorage       map[string]string        //所有日志追加到后面
-	lastRequestId    map[int64]map[int64]bool //每个客户端最后提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
-	clientChan       map[int]chan Result      //每个请求端维护一个通道
+	maxraftstate     int                   // snapshot if log grows this big
+	logStorage       map[string]string     //所有日志追加到后面
+	requestClientMap map[int64]int64       // [requestId]clientId
+	requestedId      map[int64]bool        //每个客户端提交的索引, 新成为leader的要读取写在磁盘的这个保证不重复提交
+	requestChan      map[int]chan Result   //每个请求端维护一个通道
+	clientChan       map[int64]chan Result //chan for every client
 	muChan           deadlock.Mutex
 	lastIndex        int
 	lastTerm         int
@@ -60,9 +62,9 @@ func (kv *KVServer) createClientChan() int {
 	key := 0
 	for ok {
 		key = rand.Int()
-		_, ok = kv.clientChan[key]
+		_, ok = kv.requestChan[key]
 	}
-	kv.clientChan[key] = make(chan Result)
+	kv.requestChan[key] = make(chan Result)
 	return key
 }
 func (kv *KVServer) freeClientChan() {
@@ -73,20 +75,18 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//	reply.Err = ErrWrongLeader
 	//	return
 	//}
-	DPrintf(1, "[%d]trying get rpc %v", kv.me, args.Key)
-	_, isLeader := kv.rf.GetState()
-	// todo: available
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		reply.Value = ""
-		return
-	}
 	// for finding leader
 	if len(args.Key) == 0 {
-		reply.Err = OK
+		if kv.rf.IsAvailable() {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
 		reply.Value = ""
 		return
 	}
+	DPrintf(-1, "[%d]trying get rpc %v", kv.me, args.Key)
+
 	if !kv.rf.IsAvailable() {
 		reply.Err = ErrWrongLeader
 		reply.Value = ""
@@ -122,36 +122,43 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	if value, ok := kv.logStorage[args.Key]; ok {
 		reply.Value = value
+		reply.Err = OK
+
 	} else {
 		//DPrintf(-1, "[%d] err no key : %v, log: %v", kv.me, op.Key, kv.logStorage)
 		reply.Err = ErrNoKey
+		reply.Value = ""
 	}
 	kv.mu.Unlock()
 }
+
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	//if kv.killed() {
-	//	reply.Err = ErrWrongLeader
-	//	return
-	//}
+	if kv.killed() || !kv.rf.IsAvailable() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	DPrintf(1, "[%d] trying %v %v %v", kv.me, args.Op, args.Key, args.Value)
 	op := Op{
 		Command:   args.Op,
-		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 		Key:       args.Key,
 		Value:     args.Value,
 	}
+
 	kv.mu.Lock()
-	if kv.isDuplicate(&op) {
+	if _, ok := kv.clientChan[args.ClientId]; !ok {
+		kv.clientChan[args.ClientId] = make(chan Result)
+	}
+	if kv.isDuplicate(args.RequestId) {
 		kv.mu.Unlock()
 		reply.Err = OK
 		return
 	}
-	kv.mu.Unlock()
-	chanKey := kv.createClientChan()
-	op.ChanKey = chanKey
+
 	_, _, is := kv.rf.Start(op)
 	if !is {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -159,7 +166,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//一直等待日志提交
 	//result := <-opChan
 	info := fmt.Sprintf("[%d]waiting receive... %v %v", kv.me, args.Op, args.Value)
-	result := kv.chanReceiver(chanKey, info)
+	kv.requestClientMap[args.RequestId] = args.ClientId
+	kv.mu.Unlock()
+	result := kv.chanReceiver(args.ClientId, info)
+	DPrintf(-1, "[%d] after chanReceiver log:%v", kv.me, kv.logStorage[args.Key])
 	reply.Err = result.Err
 	if result.Ok {
 		//DPrintf(0, "get applied %v", kv.logStorage[args.Key])
@@ -175,49 +185,40 @@ type Result struct {
 	Err   Err
 }
 
-func (kv *KVServer) isDuplicate(op *Op) bool {
-	_, ok := kv.lastRequestId[op.ClientId]
+func (kv *KVServer) isDuplicate(requestId int64) bool {
+	_, ok := kv.requestedId[requestId]
 	if ok {
-		_, exist := kv.lastRequestId[op.ClientId][op.RequestId]
-		DPrintf(3, "[%d] isDuplicate:%v new requestId when %v %v,id:%v, ids:%v", kv.me, exist, op.Command, op.Value, op.RequestId, kv.lastRequestId[op.ClientId])
-		return exist
+		return true
 	}
 	return false
 }
 
 //
-func (kv *KVServer) chanSender(chanKey int, msg Result, info string) {
-	kv.muChan.Lock()
-	clientChan := kv.clientChan[chanKey]
-	kv.muChan.Unlock()
+func (kv *KVServer) chanSender(chanKey int64, msg Result, info string) {
 	DPrintf(1, "begin chan %v, value %v", info, msg)
 	go func() {
-		// 检测2秒后，客户端的rpc还没把结果取走就认为网络掉了，自己关闭这个chan
+		// 检测2秒后，客户端的rpc还没把结果取走就认为raft网络掉了，自己关闭这个chan
 		time.Sleep(2 * time.Second)
 		select {
-		case <-clientChan:
-			DPrintf(1, "client receive chan time out chan %v, value %v", info, msg)
-			//kv.clientChan[chanKey] = nil
+		case <-kv.clientChan[chanKey]:
+			DPrintf(-1, "client receive chan time out chan %v, value %v", info, msg)
+			//kv.requestChan[chanKey] = nil
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Millisecond):
 			return
 		}
 	}()
-	clientChan <- msg
+	DPrintf(1, "client sending chan %v, value %v, clientId:%d", info, msg, chanKey)
+	kv.clientChan[chanKey] <- msg
 }
-func (kv *KVServer) chanReceiver(chanKey int, info string) Result {
-	kv.muChan.Lock()
-	clientChan := kv.clientChan[chanKey]
-	kv.muChan.Unlock()
+func (kv *KVServer) chanReceiver(chanKey int64, info string) Result {
 	DPrintf(1, "begin chan %v ", info)
 	select {
-	case msg := <-clientChan:
-		DPrintf(1, "end chan %v value %v", info, msg)
-		//kv.clientChan[chanKey] = nil
-
+	case msg := <-kv.clientChan[chanKey]:
+		DPrintf(-1, "end chan success %v value %v", info, msg)
 		return msg
-	case <-time.After(time.Second * 1):
-		DPrintf(1, "end chan %v because time out ", info)
+	case <-time.After(time.Second * 2):
+		DPrintf(-1, "end chan %v because time out clientId:%d", info, chanKey)
 		return Result{Ok: false, Value: "", Err: ErrWrongLeader}
 	}
 
@@ -230,36 +231,31 @@ func (kv *KVServer) opResolver(op *Op) Result {
 	}
 	kv.mu.Lock()
 	switch op.Command {
-	case "Get":
-		if value, ok := kv.logStorage[op.Key]; ok {
-			result.Value = value
-		} else {
-			//DPrintf(-1, "[%d] err no key : %v, log: %v", kv.me, op.Key, kv.logStorage)
-			result.Err = ErrNoKey
-		}
-		result.Ok = true
-		break
+	//case "Get":
+	//	if value, ok := kv.logStorage[op.Key]; ok {
+	//		result.Value = value
+	//	} else {
+	//		//DPrintf(-1, "[%d] err no key : %v, log: %v", kv.me, op.Key, kv.logStorage)
+	//		result.Err = ErrNoKey
+	//	}
+	//	result.Ok = true
+	//	break
 	case "Put":
-		if kv.isDuplicate(op) {
+		if kv.isDuplicate(op.RequestId) {
 			kv.mu.Unlock()
 			return result
 		}
 		kv.logStorage[op.Key] = op.Value
-		kv.fillRequestId(op.ClientId, op.RequestId)
-
-		//kv.lastRequestId[op.ClientId][op.RequestId] = true
-
+		kv.fillRequestId(op.RequestId)
 		result.Ok = true
 		break
 	case "Append":
-		if kv.isDuplicate(op) {
+		if kv.isDuplicate(op.RequestId) {
 			kv.mu.Unlock()
 			return result
 		}
 		kv.logStorage[op.Key] += op.Value
-		//todo:判断重复命令
-		kv.fillRequestId(op.ClientId, op.RequestId)
-		//kv.lastRequestId[op.ClientId][op.RequestId] = true
+		kv.fillRequestId(op.RequestId)
 		result.Ok = true
 		break
 	}
@@ -267,12 +263,13 @@ func (kv *KVServer) opResolver(op *Op) Result {
 	return result
 
 }
-func (kv *KVServer) fillRequestId(clientId int64, requestId int64) {
-	_, ok := kv.lastRequestId[clientId]
-	if !ok {
-		kv.lastRequestId[clientId] = make(map[int64]bool)
-	}
-	kv.lastRequestId[clientId][requestId] = true
+func (kv *KVServer) fillRequestId(requestId int64) {
+	kv.requestedId[requestId] = true
+	//_, ok := kv.requestedId[clientId]
+	//if !ok {
+	//	kv.requestedId[clientId] = make(map[int64]bool)
+	//}
+	//kv.requestedId[clientId][requestId] = true
 }
 
 //
@@ -290,7 +287,7 @@ func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	DPrintf(3, "[%d] killing log: %v", kv.me, kv.logStorage)
 	//kv.logStorage = nil
-	//kv.lastRequestId = nil
+	//kv.requestClientMap = nil
 	//kv.freeClientChan()
 }
 
@@ -316,16 +313,18 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	deadlock.Opts.Disable = true
+	deadlock.Opts.Disable = false
 	deadlock.Opts.DeadlockTimeout = time.Second * 3
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	kv.lastRequestId = make(map[int64]map[int64]bool)
+	kv.requestClientMap = make(map[int64]int64)
+	kv.requestedId = make(map[int64]bool)
 	kv.logStorage = make(map[string]string)
-	kv.clientChan = make(map[int]chan Result)
+	//kv.requestChan = make(map[int]chan Result)
+	kv.clientChan = make(map[int64]chan Result)
 	kv.lastIndex = -1
 	kv.lastTerm = 0
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -346,20 +345,21 @@ func (kv *KVServer) recoverData() {
 		//DPrintf(-1, "[%d] recover log: %v", kv.me, logP)
 		for _, l := range (*logP)[1:] {
 			op := l.Command.(Op)
-			if op.Command == "Get" {
-				continue
-			} else if op.Command == "Put" {
-				if !kv.isDuplicate(&op) {
+			if op.Command == "Put" {
+
+				if !kv.isDuplicate(op.RequestId) {
 					kv.logStorage[op.Key] = op.Value
 				}
 			} else {
-				if !kv.isDuplicate(&op) {
+
+				if !kv.isDuplicate(op.RequestId) {
 					kv.logStorage[op.Key] += op.Value
 				}
 			}
-			kv.fillRequestId(op.ClientId, op.RequestId)
+			kv.requestedId[op.RequestId] = true
+			//kv.fillRequestId(op.ClientId, op.RequestId)
 
-			//kv.lastRequestId[op.ClientId][op.RequestId] = true
+			//kv.requestClientMap[op.ClientId][op.RequestId] = true
 		}
 		DPrintf(3, "[%d] restart LOG :%v", kv.me, kv.logStorage)
 	}
@@ -420,16 +420,13 @@ func (kv *KVServer) receiveApply() {
 
 		op := msg.Command.(Op)
 
-		if op.Command != "Get" && msg.CommandIndex <= kv.lastIndex {
+		if msg.CommandIndex <= kv.lastIndex {
 			// 避免多次apply产生过多的chan消息.
 			continue
 		}
 		kv.lastIndex = msg.CommandIndex
 		kv.lastTerm = msg.CommandTerm
 		result := kv.opResolver(&op)
-		kv.mu.Lock()
-		DPrintf(3, "[%d] after apply logStorage %v", kv.me, kv.logStorage)
-		kv.mu.Unlock()
 		//DPrintf(-1, "[%d] got applych...... value %v %v result %v", kv.me, op.Command, op.Key, result.Err)
 
 		if !result.Ok {
@@ -442,7 +439,7 @@ func (kv *KVServer) receiveApply() {
 		}
 		DPrintf(1, "[%d] got raft applied %v %v %v index:%v-%v", kv.me, op.Command, op.Key, op.Value, kv.lastIndex, msg.CommandIndex)
 		info := fmt.Sprintf("[%d]to send msg from %v %v", kv.me, op.Command, op.Value)
-		go kv.chanSender(op.ChanKey, result, info) //将结果发送给相应的请求客户端
-
+		go kv.chanSender(kv.requestClientMap[op.RequestId], result, info) //将结果发送给相应的请求客户端
+		delete(kv.requestClientMap, op.RequestId)
 	}
 }
