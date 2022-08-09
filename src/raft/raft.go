@@ -140,6 +140,10 @@ func (rf *Raft) generateState() []byte {
 	e.Encode(rf.lastApplied)
 	rf.mu.Unlock()
 	data := w.Bytes()
+	if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+		// should not happen
+		log.Fatalf("[%d] generateState reset commitIndex > end log id: %d > %d ", rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx)
+	}
 	//DPrintf(-1, "[%d] generateState len %d", rf.me, len(data))
 	return data
 }
@@ -154,26 +158,31 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var log []Log
+	var logs []Log
 	var votedFor int
 	var lastSnapShotIndex int
 	var lastSnapShotTerm int
 	var currentTerm int
 	var commitIndex int
 	var lastApplied int
-	if d.Decode(&log) != nil || d.Decode(&votedFor) != nil ||
+	if d.Decode(&logs) != nil || d.Decode(&votedFor) != nil ||
 		d.Decode(&lastSnapShotIndex) != nil || d.Decode(&lastSnapShotTerm) != nil ||
 		d.Decode(&currentTerm) != nil || d.Decode(&commitIndex) != nil ||
 		d.Decode(&lastApplied) != nil {
 		DPrintf(1, "[%d] decode failed", rf.me)
 	} else {
-		rf.log = log
+		rf.log = logs
 		rf.votedFor = votedFor
 		rf.lastSnapshotIndex = lastSnapShotIndex
 		rf.lastSnapshotTerm = lastSnapShotTerm
 		rf.currentTerm = currentTerm
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
+
+	}
+	if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+		// should not happen
+		log.Fatalf("[%d] readPersist reset commitIndex > end log id: %d > %d ", rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx)
 	}
 	DPrintf(1, "[%d] reading Persist, voteF:%d, term:%d, log:%v",
 		rf.me, rf.votedFor, rf.currentTerm, rf.log)
@@ -240,7 +249,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = FOLLOWER
-		// 如果term比较大, 日志则至少一样新
+		// 如果currentTerm比较大, 日志则至少一样新
 		if (args.LastLogTerm > lastEntry.Term) ||
 			((args.LastLogTerm == lastEntry.Term) && args.LastLogIndex >= lastEntry.Idx) {
 
@@ -331,12 +340,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//} else {
 		//	rf.available = true
 		//}
-		DPrintf(-1, "[%d] available is false", rf.me)
+		DPrintf(1, "[%d] available is false", rf.me)
 		isLeader = false
 	} else {
 		index = rf.Commit(command)
-	}
+		//DPrintf(-1, "---[%d] start %v, index:%d, lastCommit: %d---", rf.me, command, index, rf.commitIndex)
 
+	}
 	//index = len(rf.log) - 1
 	return index, term, isLeader
 }
@@ -426,6 +436,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//	如果携带log, 追加log再进行apply	x
 		if len(args.Entries) == 0 {
 			if args.LeaderCommit > rf.commitIndex {
+				if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+					// should not happen
+					log.Fatalf("[%d] hearbeat commitIndex > end log id: %d > %d ",
+						rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx)
+				}
 				rf.commitIndex = args.LeaderCommit
 				go rf.apply()
 			}
@@ -434,7 +449,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		// 成功找到符合的log,直接追加.
+		if rf.commitIndex > args.LeaderCommit || rf.commitIndex > args.Entries[len(args.Entries)-1].Idx {
+			// to prevent that someone to send out-date append
+			reply.Success = false
+			rf.mu.Unlock()
+			return
+		}
 		rf.log = append(rf.log[:args.PrevLogIndex+1-rf.lastSnapshotIndex], args.Entries...)
+		if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+			// should not happen
+			log.Fatalf("[%d] append commitIndex > end log id: %d > %d last:%v,leaderCommit:%v from:%d, term:%d",
+				rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx, rf.log[len(rf.log)-1].Command,
+				args.LeaderCommit, args.LeaderId, args.Term)
+		}
 		DPrintf(1, "[%d] update data logs: %v", rf.me, rf.log)
 		// 更新commitIndex
 		//	如果是心跳, 说明之前已经完成复制了, apply即可 x
@@ -504,6 +531,11 @@ func (rf *Raft) SendAppendEntries(server int) bool {
 	//DPrintf(0, "[%d] sending heartbeat/append to %d\n", rf.me, server)
 
 	rf.mu.Lock()
+	if rf.state != LEADER {
+		// to prevent that who just became follower to send out-date append
+		rf.mu.Unlock()
+		return false
+	}
 	endOfLog := rf.log[len(rf.log)-1].Idx
 	// todo: prev change to match index
 
@@ -541,7 +573,7 @@ func (rf *Raft) SendAppendEntries(server int) bool {
 				rf.nextIndex[server]--
 				//rf.matchIdex[server]--
 			} else {
-				DPrintf(-1, "[%d] sendInstallSnapshot to %d", rf.me, server)
+				DPrintf(1, "[%d] sendInstallSnapshot to %d", rf.me, server)
 				go rf.sendInstallSnapshot(server)
 			}
 
@@ -563,21 +595,38 @@ func (rf *Raft) SendAppendEntries(server int) bool {
 
 // leader 根据matchIndex[]设置commitIndex..
 func (rf *Raft) resetCommitIndex() {
+	old := rf.commitIndex
 	rf.mu.Lock()
 	idx_cp := make([]int, len(rf.matchIdex))
 	copy(idx_cp, rf.matchIdex)
 	sort.Ints(idx_cp)
-	if rf.commitIndex < idx_cp[len(idx_cp)/2] {
-		rf.commitIndex = idx_cp[len(idx_cp)/2]
+	if rf.commitIndex < idx_cp[(len(idx_cp)-1)/2] {
+		rf.commitIndex = idx_cp[(len(idx_cp)-1)/2]
 	}
 	if rf.commitIndex < rf.lastApplied {
 		rf.commitIndex = rf.lastApplied
 	}
-
+	if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+		// should not happen
+		log.Fatalf("[%d] reset commitIndex > end log id: %d > %d ", rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx)
+	}
 	DPrintf(1, "[%d] resetCommitIndex to %d", rf.me, rf.commitIndex)
 
 	rf.mu.Unlock()
-	rf.persist() // 持久化操作
+	if old != rf.commitIndex {
+
+		// once change happened, notice others immediately
+		if rf.state == LEADER {
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					go rf.OperateLeader(i, nil, nil)
+				}
+			}
+		}
+
+		rf.apply()
+		rf.persist() // 持久化操作
+	}
 
 }
 
@@ -596,8 +645,8 @@ func (rf *Raft) apply() {
 	//rf.mu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
-			DPrintf(-999, "[%d] out of range logs %v applied:%d,commit:%d,shotIndex:%d",
-				rf.me, rf.log, applied, commitTo, rf.lastSnapshotIndex)
+			DPrintf(-999, "[%d] out of range applied:%d,commit:%d,shotIndex:%d",
+				rf.me, applied, commitTo, rf.lastSnapshotIndex)
 			log.Fatal(r)
 			os.Exit(1)
 		}
@@ -620,11 +669,11 @@ func (rf *Raft) apply() {
 
 	}
 	rf.mu.Unlock()
-	rf.muApply.Lock()
+	//rf.muApply.Lock()
 	for _, app := range apps {
 		rf.applyChan <- app
 	}
-	rf.muApply.Unlock()
+	//rf.muApply.Unlock()
 	rf.persist() // 持久化操作
 
 	DPrintf(1, "[%d] apply completed lastApplied:%d", rf.me, rf.lastApplied)
@@ -652,7 +701,7 @@ func (rf *Raft) initLeader() {
 func (rf *Raft) OperateLeader(server int, ok *int, mutex *deadlock.Mutex) {
 	//DPrintf(2, "[%d] begin sending heartbeat to %d\n", rf.me, server)
 	if rf.nextIndex[server] > rf.lastSnapshotIndex {
-		if rf.SendAppendEntries(server) {
+		if rf.SendAppendEntries(server) && ok != nil && mutex != nil {
 			mutex.Lock()
 			*ok++
 			mutex.Unlock()
@@ -699,8 +748,9 @@ func (rf *Raft) getLastEntry() Log {
 	if rf.commitIndex == 0 {
 		return Log{}
 	}
-	if rf.commitIndex >= len(rf.log) {
-		return rf.log[len(rf.log)-1]
+	if rf.commitIndex > rf.log[len(rf.log)-1].Idx {
+		// should not happen
+		log.Fatalf("[%d] commitIndex > end log id: %d > %d ", rf.me, rf.commitIndex, rf.log[len(rf.log)-1].Idx)
 	}
 	return rf.log[rf.commitIndex]
 }
@@ -949,7 +999,7 @@ func (rf *Raft) SaveStateAndSnapshot(index int, snapshot []byte) {
 	rf.log = append(rf.log[:1], rf.log[index-rf.lastSnapshotIndex+1:]...)
 
 	rf.lastSnapshotIndex = index
-	DPrintf(-1, "[%d] snapshoted, LastIncludedIndex %d, LastIncludedTerm %d",
+	DPrintf(1, "[%d] snapshoted, LastIncludedIndex %d, LastIncludedTerm %d",
 		rf.me, rf.lastSnapshotIndex, rf.lastSnapshotTerm)
 	rf.mu.Unlock()
 	state := rf.generateState()
@@ -983,7 +1033,7 @@ func (rf *Raft) InstallSnapshotRpc(args *InstallSnapshotArgs, reply *InstallSnap
 	}
 	rf.lastSnapshotIndex = args.LastIncludedIndex
 	rf.lastSnapshotTerm = args.LastIncludedTerm
-	DPrintf(-1, "[%d] RPC snapshoted,LastIncludedIndex %d, LastIncludedTerm %d",
+	DPrintf(1, "[%d] RPC snapshoted,LastIncludedIndex %d, LastIncludedTerm %d",
 		rf.me, rf.lastSnapshotIndex, rf.lastSnapshotTerm)
 	rf.mu.Unlock()
 	rf.persister.SaveStateAndSnapshot(rf.generateState(), args.Data)
@@ -1011,7 +1061,7 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 	}
 	rf.mu.Lock()
 	if args.Term != rf.currentTerm || rf.state != LEADER {
-		DPrintf(-1, "[%d] snap error because term are not same or not leader", rf.me)
+		DPrintf(1, "[%d] snap error because term are not same or not leader", rf.me)
 		rf.mu.Unlock()
 		return
 	}
@@ -1023,7 +1073,7 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 		rf.persist()
 		return
 	}
-	DPrintf(-1, "[%d] rpc snap success in server %d", rf.me, server)
+	DPrintf(1, "[%d] rpc snap success in server %d", rf.me, server)
 
 	// server accepted
 	if rf.nextIndex[server] < args.LastIncludedIndex+1 {
@@ -1043,7 +1093,7 @@ func (rf *Raft) ShouldSnapshot(limit int) bool {
 func (rf *Raft) ConverToFollower(term int) {
 	rf.mu.Lock()
 
-	DPrintf(0, "[%d] become follower in term %d", rf.me, term)
+	//DPrintf(-1, "[%d] become follower in term %d lastApplied:%d", rf.me, term, rf.lastApplied)
 	rf.state = FOLLOWER
 	rf.currentTerm = term
 	rf.votedFor = -1
@@ -1055,16 +1105,19 @@ func (rf *Raft) ConverToFollower(term int) {
 }
 
 func (rf *Raft) ConverToLeader() {
+	rf.apply() // before changing to leader, apply to avoid data not yet synchronized
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = LEADER
-	rf.available = true
-	DPrintf(-1, "[%d] become leader (currentTerm=%d)\n", rf.me, rf.currentTerm)
+	rf.available = false
+	DPrintf(-1, "[%d] become leader (currentTerm=%d), lastApplied:%d commit:%d",
+		rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
 	rf.matchIdex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i, _ := range rf.nextIndex {
 		rf.nextIndex[i] = 1
 	}
+
 }
 
 // Make
